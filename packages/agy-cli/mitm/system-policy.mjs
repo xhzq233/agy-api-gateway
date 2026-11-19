@@ -86,6 +86,13 @@ export const KNOWN_REFUSED_SYSTEM_HASHES = new Set([
   '10591efdcea75a1645b7f19037b36c979849ad4ec27f11ce87a8393423597b44',
 ])
 export const systemFingerprint = text => createHash('sha256').update(text.trim().replace(/\s+/g,' ')).digest('hex')
+export function removeKnownRefusedParagraphs(text) {
+  return text.split(/(\r?\n\s*\r?\n)/).map(p => {
+    const trimmed = p.trim()
+    if (/^#\s*(?:Harness|System)\b/i.test(trimmed)) return ''
+    return p
+  }).join('')
+}
 // CC may append an unrelated line to the same paragraph. Match only a full
 // paragraph or a complete leading line sequence, retaining the following text.
 function securityPrefixLength(paragraph, hashes) {

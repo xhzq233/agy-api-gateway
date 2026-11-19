@@ -5,7 +5,16 @@ import os from 'node:os'
 import path from 'node:path'
 import { MitmBroker } from '../packages/agy-cli/mitm/broker.mjs'
 import { WireStore, WireTurn, projectCc, replaceRequest } from '../packages/agy-cli/mitm/protocol.mjs'
-import { AGY_IDENTITY, AGY_NATIVE_SECURITY, KNOWN_REFUSED_SYSTEM_HASHES, systemFingerprint, assertForwardableSystem, assertSupportedClient } from '../packages/agy-cli/mitm/system-policy.mjs'
+import { AGY_IDENTITY, AGY_NATIVE_SECURITY, KNOWN_REFUSED_SYSTEM_HASHES, systemFingerprint, assertForwardableSystem, assertSupportedClient, removeKnownRefusedParagraphs } from '../packages/agy-cli/mitm/system-policy.mjs'
+
+test('only paragraphs beginning with the selected headings are removed', () => {
+  const text = 'Keep this instruction.\n\n# Harness\nHarness instruction.\n\n## System\nKeep this subsection.\n\n# System\nSystem instruction.\n\nKeep the last instruction.'
+  const result = removeKnownRefusedParagraphs(text)
+  assert.doesNotMatch(result, /Harness instruction|System instruction/)
+  assert.match(result, /Keep this instruction/)
+  assert.match(result, /## System\nKeep this subsection/)
+  assert.match(result, /Keep the last instruction/)
+})
 
 test('numeric thinking budget is ignored while preserving AGY thinking and requested display', () => {
   const body={model:'gemini-4-argon-high',messages:[{role:'user',content:'hello'}],thinking:{type:'enabled',budget_tokens:4096,display:'summarized'}}
