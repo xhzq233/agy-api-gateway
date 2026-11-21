@@ -74,17 +74,93 @@ export class WireStore {
   }
   // Look up the exact assistant message across models, including records
   // created before cross-model replay was supported. Never guess tool inputs.
+  // If CC normalized a persisted tool_use input, changed an opaque thinking
+  // signature, or dropped an empty thinking block, the unique tool_use ID (or
+  // a unique thinking signature) still identifies the signed provider call.
+  // Only a record with such an anchor may be used; the signed wire part is
+  // replayed, and a thinking block without a match is dropped rather than
+  // inventing a signature.
   getCross(content, model=null) {
     const canonical=canonicalBlocks(content), contentKey=hash([model,canonical])
-    const match=value=>{
-      if(value?.version!==2||!Array.isArray(value.content)||!Array.isArray(value.parts))return false
-      // CC may persist streamed blocks as separate assistant messages.
+    const exactMatches=value=>{
       let offset=0
-      return canonical.every(block=>{
+      const matches=[]
+      for(const block of canonical) {
         const index=value.content.findIndex((part,i)=>i>=offset&&stable(part)===stable(block))
-        if(index<0)return false
-        offset=index+1;return true
-      })
+        if(index<0)return undefined
+        matches.push({block,part:value.content[index]});offset=index+1
+      }
+      return matches
+    }
+    const relaxedMatches=value=>{
+      const ids=new Set(value.content.filter(b=>b.type==='tool_use').map(b=>b.id))
+      const signatures=new Set(value.content.filter(b=>b.type==='thinking').map(b=>b.signature).filter(Boolean))
+      const anchored=canonical.some(block=>block.type==='tool_use'?ids.has(block.id):block.type==='thinking'&&signatures.has(block.signature))
+      if(!anchored)return undefined
+      const used=new Set(), pinned=new Map(), matches=[]
+      for(const block of canonical) {
+        if(block.type==='text') {
+          const i=value.content.findIndex((part,j)=>!used.has(j)&&stable(part)===stable(block))
+          if(i>=0){used.add(i);matches.push({block,part:value.content[i]})}
+          else matches.push({block,part:null})
+          continue
+        }
+        if(block.type==='thinking') {
+          let i=value.content.findIndex((part,j)=>!used.has(j)&&part.type==='thinking'&&part.signature===block.signature)
+          if(i<0)i=value.content.findIndex((part,j)=>!used.has(j)&&stable(part)===stable(block))
+          if(i>=0){used.add(i);matches.push({block,part:value.content[i]})}
+          else matches.push({block,part:null})
+          continue
+        }
+        if(block.type==='redacted_thinking'){matches.push({block,part:null});continue}
+        if(block.type!=='tool_use')return undefined
+        let i=value.content.findIndex((part,j)=>!used.has(j)&&part.type==='tool_use'&&part.id===block.id)
+        if(i<0) {
+          // IDs changed (or all were stripped): pair same-name calls in order,
+          // but only when both sides have the same number of that name.
+          const wanted=canonical.filter(b=>b.type==='tool_use'&&b.name===block.name).length
+          const available=value.content.filter(part=>part.type==='tool_use'&&part.name===block.name).length
+          if(wanted===available) {
+            const nth=pinned.get(block.name)||0
+            const candidates=value.content.map((part,j)=>({part,j})).filter(({part,j})=>!used.has(j)&&part.type==='tool_use'&&part.name===block.name)
+            if(candidates[nth])i=candidates[nth].j
+            pinned.set(block.name,nth+1)
+          }
+        }
+        if(i<0||value.content[i].name!==block.name)return undefined
+        used.add(i);matches.push({block,part:value.content[i]})
+      }
+      return matches
+    }
+    const partsFor=value=>{
+      if(value?.version!==2||!Array.isArray(value.content)||!Array.isArray(value.parts))return undefined
+      const exact=exactMatches(value)
+      const matches=exact||relaxedMatches(value)
+      if(!matches)return undefined
+      const calls=canonical.filter(b=>b.type==='tool_use')
+      if(matches.filter(m=>m.block.type==='tool_use'&&m.part).length!==calls.length)return undefined
+      const toolIndex=new Map()
+      let n=0
+      for(let i=0;i<value.content.length;i++)if(value.content[i]?.type==='tool_use')toolIndex.set(i,n++)
+      const wireCalls=value.parts.filter(p=>p?.functionCall)
+      const out=[]
+      for(const {block,part} of matches) {
+        if(block.type==='thinking') {
+          if(part)out.push(...(model?structuredClone(value.parts.filter(p=>p.thought===true)):[]))
+        } else if(block.type==='text') {
+          out.push({text:block.text})
+        } else if(block.type==='tool_use') {
+          const i=value.content.indexOf(part),wire=wireCalls[toolIndex.get(i)]
+          if(!wire||wire.functionCall.name!==block.name)return undefined
+          out.push(structuredClone(wire))
+        } else if(block.type==='redacted_thinking') {
+          // No signed provider part exists for a redacted block; dropping it
+          // is the only replay that does not fabricate a signature.
+        } else {
+          return undefined
+        }
+      }
+      return out
     }
     let value=this.cross.get(contentKey)
     if(!value) {
@@ -98,24 +174,18 @@ export class WireStore {
         const record=this.index(name.slice(0,-5))
         if(record?.version!==2)continue
         const candidate=this.raw(record.wireKey)
-        if(!match(candidate)||model&&this.messageKey(model,candidate.content)!==record.messageKey)continue
+        if(partsFor(candidate)===undefined||model&&this.messageKey(model,candidate.content)!==record.messageKey)continue
         if(hash(candidate)!==record.recordHash)throw fail('Damaged retained wire metadata',409)
         value=candidate;this.cross.set(contentKey,value);break
       }
     }
     if(!value)return undefined
-    if(!match(value))throw fail('Invalid retained wire metadata',409)
-    const calls=value.content.filter(b=>b.type==='tool_use'), wire=value.parts.filter(p=>p?.functionCall)
-    if(calls.length!==wire.length||calls.some((c,i)=>c.name!==wire[i].functionCall.name))throw fail('Tool call differs from wire metadata',409)
+    const parts=partsFor(value)
+    if(parts===undefined)throw fail('Invalid retained wire metadata',409)
     // Retain only the blocks CC actually sent, even if the original response
     // contained more blocks. Old reasoning does not cross models, but the
     // original function-call part and its signature must remain together.
-    return canonical.flatMap(block=>{
-      if(block.type==='thinking')return model?structuredClone(value.parts.filter(part=>part.thought===true)):[]
-      if(block.type==='text')return [{text:block.text}]
-      if(block.type==='tool_use')return [structuredClone(wire[calls.findIndex(c=>stable(c)===stable(block))])]
-      throw fail('Unsupported assistant content')
-    })
+    return parts
   }
   get(model, history, content) {
     const key=this.key(model,history,content),messageKey=this.messageKey(model,content)
