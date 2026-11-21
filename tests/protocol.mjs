@@ -182,3 +182,47 @@ test('switching models retains tool signatures without old reasoning', t => {
   assert.deepEqual(claudeProjection.contents[1].parts,[{text:'visible'},{functionCall:{name:'Read',args:{path:'x'},id:'original-id'}}])
   assert.deepEqual(projectCc({model:source,messages,tools:[{name:'Read',input_schema:{type:'object'}}]},store).contents[1].parts,original)
 })
+
+test('normalized persisted tool input replays the signed wire call',()=>{
+  const store=new WireStore(), model='gemini-4-carbon-medium'
+  const user={role:'user',content:'synthetic'}
+  const issued=[{type:'text',text:'visible'},{type:'tool_use',id:'toolu_fixture',name:'Read',input:{path:'sample'}}]
+  const signed={functionCall:{id:'wire-call',name:'Read',args:{path:'sample'}},thoughtSignature:'tool-signature'}
+  store.save(model,[user],issued,[{text:'visible',thoughtSignature:'text-signature'},signed])
+  const persisted=[{type:'text',text:'visible'},{type:'tool_use',id:'toolu_fixture',name:'Read',input:{path:'sample',offset:0}}]
+  const messages=[user,{role:'assistant',content:persisted},{role:'user',content:[{type:'tool_result',tool_use_id:'toolu_fixture',content:'done'}]}]
+  const projected=projectCc({model,messages,tools:[{name:'Read',input_schema:{type:'object',properties:{path:{type:'string'},offset:{type:'number'}}}}]},store)
+  assert.deepEqual(projected.contents[1].parts,[{text:'visible'},signed])
+  assert.equal(projected.contents[2].parts[0].functionResponse.id,'wire-call')
+})
+
+test('changed thinking signature is dropped while the anchored tool call replays',()=>{
+  const store=new WireStore(), model='gemini-4-carbon-medium'
+  const user={role:'user',content:'synthetic'}
+  const issued=[{type:'thinking',thinking:'plan',signature:'source-signature'},{type:'tool_use',id:'toolu_fixture',name:'Read',input:{path:'sample'}}]
+  const signed={functionCall:{id:'wire-call',name:'Read',args:{path:'sample'}},thoughtSignature:'tool-signature'}
+  store.save(model,[user],issued,[{thought:true,text:'plan',thoughtSignature:'thought-signature'},signed])
+  const persisted=[{type:'thinking',thinking:'plan',signature:'changed-signature'},{type:'tool_use',id:'toolu_fixture',name:'Read',input:{path:'sample'}}]
+  const messages=[user,{role:'assistant',content:persisted},{role:'user',content:[{type:'tool_result',tool_use_id:'toolu_fixture',content:'done'}]}]
+  const projected=projectCc({model,messages,tools:[{name:'Read',input_schema:{type:'object'}}]},store)
+  assert.deepEqual(projected.contents[1].parts,[signed])
+})
+
+test('changed tool IDs pair by a unique anchor and matching name counts',()=>{
+  const store=new WireStore(), model='gemini-4-carbon-medium'
+  const user={role:'user',content:'synthetic'}
+  const signedA={functionCall:{id:'wire-a',name:'Read',args:{path:'a'}},thoughtSignature:'sig-a'}
+  const signedB={functionCall:{id:'wire-b',name:'Read',args:{path:'b'}},thoughtSignature:'sig-b'}
+  store.save(model,[user],[{type:'tool_use',id:'toolu_a',name:'Read',input:{path:'a'}},{type:'tool_use',id:'toolu_b',name:'Read',input:{path:'b'}}],[signedA,signedB])
+  const persisted=[{type:'tool_use',id:'toolu_a',name:'Read',input:{path:'a'}},{type:'tool_use',id:'toolu_new',name:'Read',input:{path:'b'}}]
+  assert.deepEqual(store.getCross(persisted),[signedA,signedB])
+})
+
+test('changed tool IDs or names without a signed anchor are not guessed',()=>{
+  const store=new WireStore(), model='gemini-4-carbon-medium'
+  const user={role:'user',content:'synthetic'}
+  const signed={functionCall:{id:'wire-call',name:'Read',args:{path:'sample'}},thoughtSignature:'tool-signature'}
+  store.save(model,[user],[{type:'tool_use',id:'toolu_old',name:'Read',input:{path:'sample'}}],[signed])
+  assert.equal(store.getCross([{type:'tool_use',id:'toolu_new',name:'Read',input:{path:'sample'}}]),undefined)
+  assert.equal(store.getCross([{type:'tool_use',id:'toolu_old',name:'Write',input:{path:'sample'}}]),undefined)
+})
